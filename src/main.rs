@@ -60,54 +60,28 @@ impl Packet {
 }
 
 #[derive(Debug, Clone)]
-enum Connection {
-    SynSent {
-        time: Instant,
-    },
-    SynAckRecv {
-        time: Instant,
-        delay: Duration,
-    },
-    RequestSent {
-        time: Instant,
-        delay: Duration,
-    },
+struct Connection {
+    last_sent: Instant,
+    delay: Option<Duration>,
 }
 
 impl Connection {
     fn new() -> Self {
-        Connection::SynSent {
-            time: Instant::now(),
+        Connection {
+            last_sent: Instant::now(),
+            delay: None,
         }
     }
 
     fn syn_ack(&mut self) {
-        if let Connection::SynSent { time } = self.clone() {
-            *self = Connection::SynAckRecv {
-                time: Instant::now(),
-                delay: time.elapsed(),
-            };
+        if self.delay == None {
+            let delay = self.last_sent.elapsed();
+            self.delay = Some(delay);
         }
     }
 
     fn request_sent(&mut self) {
-        let new = match self {
-            Connection::SynSent { .. } => None,
-            Connection::SynAckRecv { delay, .. } =>
-                Some(Connection::RequestSent {
-                    delay: delay.clone(),
-                    time: Instant::now(),
-                }),
-            Connection::RequestSent { delay, .. } => {
-                Some(Connection::RequestSent {
-                    delay: delay.clone(),
-                    time: Instant::now(),
-                })
-            },
-        };
-        if let Some(new) = new {
-            *self = new;
-        }
+        self.last_sent = Instant::now();
     }
 }
 
@@ -127,25 +101,21 @@ fn callback(msg: &Message, conns: &mut Connections) {
         } else if let Some(mut conn) = conns.get_mut(&key) {
             if pkt.flag_syn && pkt.flag_ack {
                 conn.syn_ack();
-            } else if pkt.flag_syn {
-                // ignore syn
             } else if pkt.from_local() {
                 // request sent from local
                 conn.request_sent();
             } else {
                 // response from remote
-                if let Connection::RequestSent { delay, time } = conn {
-                    if time.elapsed() < min(*delay, *WAIT) {
+                if let Connection { delay: Some(delay), last_sent } = conn {
+                    if last_sent.elapsed() < min(*delay, *WAIT) {
                         verdict = Verdict::Drop;
-                        println!("drop {:?}ms from {:?}, rtt {:?}ms",
-                                 time.elapsed().subsec_millis(), pkt.src,
-                                 delay.subsec_millis());
+                        println!("drop {:?}ms < rtt {}ms from {:?}",
+                                 last_sent.elapsed().subsec_millis(),
+                                 delay.subsec_millis(), pkt.src);
                     } else {
-                        /*
-                        println!("accept {:?}ms from {:?}, rtt {:?}ms",
-                                 time.elapsed().subsec_millis(),
-                                 pkt.src, delay.subsec_millis());
-                        */
+                        println!("accept {:?}ms (rtt {}ms) from {:?}",
+                                 last_sent.elapsed().subsec_millis(),
+                                 delay.subsec_millis(),pkt.src);
                         expired = true;
                     }
                 }
@@ -156,15 +126,10 @@ fn callback(msg: &Message, conns: &mut Connections) {
         }
         if conns.len() > HASHMAP_LEN_HIGH {
             let empties: Vec<_> = conns.iter().filter_map(|(key, conn)| {
-                match conn {
-                    Connection::SynSent { time } |
-                    Connection::SynAckRecv { time, .. } |
-                    Connection::RequestSent { time, .. } =>
-                        if time.elapsed() > *CONN_TIMEOUT {
-                            Some(key.clone())
-                        } else {
-                            None
-                        }
+                if conn.last_sent.elapsed() > *CONN_TIMEOUT {
+                    Some(key.clone())
+                } else {
+                    None
                 }
             }).collect();
             for key in empties {
