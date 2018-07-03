@@ -1,0 +1,9 @@
+[package]
+name = "antihijack"
+version = "0.1.0"
+authors = ["sorz <me@sorz.org>"]
+
+[dependencies]
+nfqueue = "0.9.1"
+libc = "0.2.42"
+lazy_static = "1.0"
