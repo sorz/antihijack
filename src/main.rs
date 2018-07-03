@@ -2,13 +2,14 @@ extern crate libc;
 extern crate nfqueue;
 #[macro_use]
 extern crate lazy_static;
+use std::cmp::min;
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use libc::AF_INET;
 use nfqueue::{Message, Verdict, Queue, CopyMode};
 
-const DROP_WITHIN_MILLIS: u64 = 8;
+const DROP_WITHIN_MILLIS: u64 = 20;
 
 lazy_static! {
     static ref WAIT: Duration = Duration::from_millis(DROP_WITHIN_MILLIS);
@@ -53,8 +54,58 @@ impl Packet {
 
 }
 
+#[derive(Debug, Clone)]
+enum Connection {
+    SynSent {
+        time: Instant,
+    },
+    SynAckRecv {
+        delay: Duration,
+    },
+    RequestSent {
+        time: Instant,
+        delay: Duration,
+    },
+}
 
-type Connections = HashMap<(SocketAddrV4, SocketAddrV4), Option<Instant>>;
+impl Connection {
+    fn new() -> Self {
+        Connection::SynSent {
+            time: Instant::now(),
+        }
+    }
+
+    fn syn_ack(&mut self) {
+        if let Connection::SynSent { time } = self.clone() {
+            *self = Connection::SynAckRecv {
+                delay: time.elapsed()
+            };
+        }
+    }
+
+    fn request_sent(&mut self) {
+        let new = match self {
+            Connection::SynSent { .. } => None,
+            Connection::SynAckRecv { delay } =>
+                Some(Connection::RequestSent {
+                    delay: delay.clone(),
+                    time: Instant::now(),
+                }),
+            Connection::RequestSent { delay, .. } => {
+                Some(Connection::RequestSent {
+                    delay: delay.clone(),
+                    time: Instant::now(),
+                })
+            },
+        };
+        if let Some(new) = new {
+            *self = new;
+        }
+    }
+}
+
+
+type Connections = HashMap<(SocketAddrV4, SocketAddrV4), Connection>;
 
 fn callback(msg: &Message, conns: &mut Connections) {
     //println!("{} -> msg: {}", msg.get_indev(), msg);
@@ -62,31 +113,37 @@ fn callback(msg: &Message, conns: &mut Connections) {
     if let Some(pkt) = Packet::parse(msg.get_payload()) {
         //println!("{:?}", pkt);
         let key = pkt.conn_tuple();
-        match (pkt.flag_syn, pkt.flag_ack) {
-            (true, false) => (), // ignore SYN until SYN/ACK received
-            (true, true) => drop(conns.insert(key, None)), // wait for ACK
-            (false, _) => match conns.get(&key).cloned() {
-                None => (), // not being tracked
-                Some(_) if pkt.from_local() =>
-                    // update time on client's request
-                    drop(conns.insert(key, Some(Instant::now()))),
-                Some(None) =>
-                    // remote push data without request from local
-                    return drop(conns.remove(&key)),
-                Some(Some(t)) if t.elapsed() > *WAIT => {
-                    // after waiting time, cancel tracking
-                    //println!("accept {:?}ms from {:?}",
-                    //         t.elapsed().subsec_millis(),
-                    //         pkt.src);
-                    conns.remove(&key);
-                },
-                Some(Some(t)) => {
-                    // received just after handshaking, drop it
-                    verdict = Verdict::Drop;
-                    println!("drop {:?}ms from {:?}",
-                             t.elapsed().subsec_millis(), pkt.src);
-                },
-            },
+        let mut expired = false;
+        if pkt.flag_syn && !pkt.flag_ack {
+            // track new connection on ACK
+            conns.insert(key, Connection::new());
+        } else if let Some(mut conn) = conns.get_mut(&key) {
+            if pkt.flag_syn && pkt.flag_ack {
+                conn.syn_ack();
+            } else if pkt.flag_syn {
+                // ignore syn
+            } else if pkt.from_local() {
+                // request sent from local
+                conn.request_sent();
+            } else {
+                // response from remote
+                if let Connection::RequestSent { delay, time } = conn {
+                    if time.elapsed() < min(*delay, *WAIT) {
+                        verdict = Verdict::Drop;
+                        println!("drop {:?}ms from {:?}, rtt {:?}ms",
+                                 time.elapsed().subsec_millis(), pkt.src,
+                                 delay.subsec_millis());
+                    } else {
+                        println!("accept {:?}ms from {:?}, rtt {:?}ms",
+                                 time.elapsed().subsec_millis(),
+                                 pkt.src, delay.subsec_millis());
+                        expired = true;
+                    }
+                }
+            }
+        }
+        if expired {
+            conns.remove(&key);
         }
     }
     msg.set_verdict(verdict);
