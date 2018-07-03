@@ -9,10 +9,15 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use libc::AF_INET;
 use nfqueue::{Message, Verdict, Queue, CopyMode};
 
-const DROP_WITHIN_MILLIS: u64 = 20;
+const DROP_WITHIN_MILLIS: u64 = 10;
+const CONNECTION_TRACKING_SECS: u64 = 10;
+const HASHMAP_LEN_HIGH: usize = 100;
+const HASHMAP_LEN_MAX: usize = 1000;
+
 
 lazy_static! {
     static ref WAIT: Duration = Duration::from_millis(DROP_WITHIN_MILLIS);
+    static ref CONN_TIMEOUT: Duration = Duration::from_secs(CONNECTION_TRACKING_SECS);
 }
 
 #[derive(Debug)]
@@ -60,6 +65,7 @@ enum Connection {
         time: Instant,
     },
     SynAckRecv {
+        time: Instant,
         delay: Duration,
     },
     RequestSent {
@@ -78,7 +84,8 @@ impl Connection {
     fn syn_ack(&mut self) {
         if let Connection::SynSent { time } = self.clone() {
             *self = Connection::SynAckRecv {
-                delay: time.elapsed()
+                time: Instant::now(),
+                delay: time.elapsed(),
             };
         }
     }
@@ -86,7 +93,7 @@ impl Connection {
     fn request_sent(&mut self) {
         let new = match self {
             Connection::SynSent { .. } => None,
-            Connection::SynAckRecv { delay } =>
+            Connection::SynAckRecv { delay, .. } =>
                 Some(Connection::RequestSent {
                     delay: delay.clone(),
                     time: Instant::now(),
@@ -134,9 +141,11 @@ fn callback(msg: &Message, conns: &mut Connections) {
                                  time.elapsed().subsec_millis(), pkt.src,
                                  delay.subsec_millis());
                     } else {
+                        /*
                         println!("accept {:?}ms from {:?}, rtt {:?}ms",
                                  time.elapsed().subsec_millis(),
                                  pkt.src, delay.subsec_millis());
+                        */
                         expired = true;
                     }
                 }
@@ -144,6 +153,26 @@ fn callback(msg: &Message, conns: &mut Connections) {
         }
         if expired {
             conns.remove(&key);
+        }
+        if conns.len() > HASHMAP_LEN_HIGH {
+            let empties: Vec<_> = conns.iter().filter_map(|(key, conn)| {
+                match conn {
+                    Connection::SynSent { time } |
+                    Connection::SynAckRecv { time, .. } |
+                    Connection::RequestSent { time, .. } =>
+                        if time.elapsed() > *CONN_TIMEOUT {
+                            Some(key.clone())
+                        } else {
+                            None
+                        }
+                }
+            }).collect();
+            for key in empties {
+                conns.remove(&key);
+            }
+        }
+        if conns.len() > HASHMAP_LEN_MAX {
+            conns.clear();
         }
     }
     msg.set_verdict(verdict);
