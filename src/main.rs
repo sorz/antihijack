@@ -1,5 +1,8 @@
+#[macro_use]
+extern crate log;
 extern crate libc;
 extern crate nfqueue;
+extern crate env_logger;
 #[macro_use]
 extern crate lazy_static;
 use std::cmp::min;
@@ -10,7 +13,7 @@ use libc::AF_INET;
 use nfqueue::{Message, Verdict, Queue, CopyMode};
 
 const DROP_WITHIN_MILLIS: u64 = 10;
-const CONNECTION_TRACKING_SECS: u64 = 10;
+const CONNECTION_TRACKING_SECS: u64 = 30;
 const HASHMAP_LEN_HIGH: usize = 100;
 const HASHMAP_LEN_MAX: usize = 1000;
 
@@ -89,7 +92,7 @@ impl Connection {
 type Connections = HashMap<(SocketAddrV4, SocketAddrV4), Connection>;
 
 fn callback(msg: &Message, conns: &mut Connections) {
-    //println!("{} -> msg: {}", msg.get_indev(), msg);
+    trace!("{} -> msg: {}", msg.get_indev(), msg);
     let mut verdict = Verdict::Accept;
     if let Some(pkt) = Packet::parse(msg.get_payload()) {
         //println!("{:?}", pkt);
@@ -107,15 +110,21 @@ fn callback(msg: &Message, conns: &mut Connections) {
             } else {
                 // response from remote
                 if let Connection { delay: Some(delay), last_sent } = conn {
+                    let log = format!(
+                        "{:?}ms (RTT {}ms, from {:?})",
+                        last_sent.elapsed().subsec_millis(),
+                        delay.subsec_millis(),
+                        pkt.src,
+                    );
                     if last_sent.elapsed() < min(*delay, *WAIT) {
                         verdict = Verdict::Drop;
-                        println!("drop {:?}ms < rtt {}ms from {:?}",
-                                 last_sent.elapsed().subsec_millis(),
-                                 delay.subsec_millis(), pkt.src);
+                        info!("drop {}", log);
                     } else {
-                        println!("accept {:?}ms (rtt {}ms) from {:?}",
-                                 last_sent.elapsed().subsec_millis(),
-                                 delay.subsec_millis(),pkt.src);
+                        if last_sent.elapsed() < *WAIT {
+                            info!("accept {}", log);
+                        } else {
+                            debug!("accept {}", log);
+                        }
                         expired = true;
                     }
                 }
@@ -137,6 +146,7 @@ fn callback(msg: &Message, conns: &mut Connections) {
             }
         }
         if conns.len() > HASHMAP_LEN_MAX {
+            // prevent DoS
             conns.clear();
         }
     }
@@ -144,14 +154,17 @@ fn callback(msg: &Message, conns: &mut Connections) {
 }
 
 fn main() {
+    env_logger::init();
     let conns = HashMap::new();
     let mut queue = Queue::new(conns);
     queue.open();
     if queue.bind(AF_INET) != 0 {
         panic!("fail to bind on queue");
     }
-    queue.create_queue(0, callback);
+    let queue_num = 0;
+    queue.create_queue(queue_num, callback);
     queue.set_mode(CopyMode::CopyPacket, 20 + 16);
+    info!("Listen on netfilter queue {}", queue_num);
     queue.run_loop();
 }
 
