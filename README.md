@@ -41,3 +41,9 @@ iptables -A OUTPUT -i ppp0 -p tcp --sport 80 --tcp-flags FIN,RST NONE -j anti-hi
 
 Note that the port number 80 was hard-coded, others would not work.
 
+## Effectiveness
+In my case, the injected packets usually come around 2 milliseconds, while
+sometimes is longer. `--drop 3 --wait 10` works well for me, although it
+makes some false positives for near CDNs, TCP retransmission will be
+tiggered quickly so not a big issue.
+
