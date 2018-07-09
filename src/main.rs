@@ -187,7 +187,7 @@ fn main() {
              .takes_value(true)
              .default_value("5"))
         .arg(Arg::with_name("may-drop-within")
-             .long("may-drop")
+             .long("wait")
              .short("m")
              .help("Drop if less that it AND less than the RTT.")
              .takes_value(true)
