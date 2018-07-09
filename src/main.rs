@@ -1,5 +1,6 @@
 #[macro_use]
 extern crate log;
+extern crate clap;
 extern crate libc;
 extern crate nfqueue;
 extern crate env_logger;
@@ -9,10 +10,10 @@ use std::cmp::min;
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
+use clap::{Arg, App};
 use libc::AF_INET;
 use nfqueue::{Message, Verdict, Queue, CopyMode};
 
-const DROP_WITHIN_MILLIS: u64 = 10;
 const CONNECTION_TRACKING_SECS: u64 = 30;
 const HASHMAP_LEN_HIGH: usize = 100;
 const HASHMAP_LEN_MAX: usize = 1000;
@@ -166,8 +167,36 @@ fn callback(msg: &Message, state: &mut State) {
 }
 
 fn main() {
+    let matches = App::new("antihijack")
+        .version(env!("CARGO_PKG_VERSION"))
+        .author("Shell Chen <me@sorz.org>")
+        .about("Drop specific TCP fragments according to their arrival time")
+        .arg(Arg::with_name("queue-num")
+             .long("queue")
+             .short("n")
+             .help("Netfilter queue number which this program bind on.")
+             .takes_value(true)
+             .default_value("0"))
+        .arg(Arg::with_name("drop-within")
+             .long("drop")
+             .short("d")
+             .help("Drop everything come in less that it in millisecond.")
+             .takes_value(true)
+             .default_value("5"))
+        .arg(Arg::with_name("may-drop-within")
+             .long("may-drop")
+             .short("m")
+             .help("Drop if less that it AND less than the RTT.")
+             .takes_value(true)
+             .default_value("20"))
+        .get_matches();
+
     env_logger::init();
-    let state = State::new(DROP_WITHIN_MILLIS);
+    let may_drop = matches.value_of("may-drop-within")
+        .expect("missing argumment may-drop-within")
+        .parse().expect("may-drop-within must be a postive integer");
+
+    let state = State::new(may_drop);
     let mut queue = Queue::new(state);
     queue.open();
     if queue.bind(AF_INET) != 0 {
