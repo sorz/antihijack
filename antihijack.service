@@ -1,0 +1,21 @@
+[Unit]
+Description=Filter out ISP's HTTP hijack packets
+After=network.target
+
+[Service]
+Type=simple
+User=nobody
+Group=nobody
+Environment=RUST_LOG=info
+ExecStart=/opt/antihijack/antihijack --drop 3 --wait 10
+Restart=on-failure
+
+AmbientCapabilities=CAP_NET_ADMIN
+PrivateDevices=true
+ProtectSystem=strict 
+ProtectHome=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target
+
