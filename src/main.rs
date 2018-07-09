@@ -92,14 +92,16 @@ impl Connection {
 
 struct State {
     conns: HashMap<(SocketAddrV4, SocketAddrV4), Connection>,
-    max_wait: Duration,
+    drop: Duration,
+    wait: Duration,
 }
 
 impl State {
-    fn new(wait_millis: u64) -> Self {
+    fn new(drop_millis: u64, wait_millis: u64) -> Self {
         State {
             conns: HashMap::new(),
-            max_wait: Duration::from_millis(wait_millis),
+            drop: Duration::from_millis(drop_millis),
+            wait: Duration::from_millis(wait_millis),
         }
     }
 }
@@ -123,17 +125,18 @@ fn callback(msg: &Message, state: &mut State) {
             } else {
                 // response from remote
                 if let Connection { delay: Some(delay), last_sent } = conn {
+                    let t = last_sent.elapsed();
                     let log = format!(
                         "{:?}ms (RTT {}ms, from {:?})",
-                        last_sent.elapsed().subsec_millis(),
+                        t.subsec_millis(),
                         delay.subsec_millis(),
                         pkt.src,
                     );
-                    if last_sent.elapsed() < min(*delay, state.max_wait) {
+                    if t < state.drop || t < min(*delay, state.wait) {
                         verdict = Verdict::Drop;
                         info!("drop {}", log);
                     } else {
-                        if last_sent.elapsed() < state.max_wait {
+                        if t < state.wait {
                             info!("accept {}", log);
                         } else {
                             debug!("accept {}", log);
@@ -192,17 +195,25 @@ fn main() {
         .get_matches();
 
     env_logger::init();
-    let may_drop = matches.value_of("may-drop-within")
+    let drop = matches.value_of("drop-within")
+        .expect("missing argumment drop-within")
+        .parse().expect("drop-within must be a non-negative");
+    let wait = matches.value_of("may-drop-within")
         .expect("missing argumment may-drop-within")
         .parse().expect("may-drop-within must be a postive integer");
+    if wait <= drop {
+        panic!("<may-drop-within> must larger than <drop-within>")
+    }
+    let queue_num = matches.value_of("queue-num")
+        .expect("missing argument queue-num")
+        .parse().expect("queue-num must be a non-negative integer");
 
-    let state = State::new(may_drop);
+    let state = State::new(drop, wait);
     let mut queue = Queue::new(state);
     queue.open();
     if queue.bind(AF_INET) != 0 {
         panic!("fail to bind on queue");
     }
-    let queue_num = 0;
     queue.create_queue(queue_num, callback);
     queue.set_mode(CopyMode::CopyPacket, 20 + 16);
     info!("Listen on netfilter queue {}", queue_num);
