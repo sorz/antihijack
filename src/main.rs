@@ -19,7 +19,6 @@ const HASHMAP_LEN_MAX: usize = 1000;
 
 
 lazy_static! {
-    static ref WAIT: Duration = Duration::from_millis(DROP_WITHIN_MILLIS);
     static ref CONN_TIMEOUT: Duration = Duration::from_secs(CONNECTION_TRACKING_SECS);
 }
 
@@ -89,19 +88,32 @@ impl Connection {
 }
 
 
-type Connections = HashMap<(SocketAddrV4, SocketAddrV4), Connection>;
 
-fn callback(msg: &Message, conns: &mut Connections) {
+struct State {
+    conns: HashMap<(SocketAddrV4, SocketAddrV4), Connection>,
+    max_wait: Duration,
+}
+
+impl State {
+    fn new(wait_millis: u64) -> Self {
+        State {
+            conns: HashMap::new(),
+            max_wait: Duration::from_millis(wait_millis),
+        }
+    }
+}
+
+fn callback(msg: &Message, state: &mut State) {
     trace!("{} -> msg: {}", msg.get_indev(), msg);
     let mut verdict = Verdict::Accept;
     if let Some(pkt) = Packet::parse(msg.get_payload()) {
-        //println!("{:?}", pkt);
+        trace!("{:?}", pkt);
         let key = pkt.conn_tuple();
         let mut expired = false;
         if pkt.flag_syn && !pkt.flag_ack {
             // track new connection on ACK
-            conns.insert(key, Connection::new());
-        } else if let Some(mut conn) = conns.get_mut(&key) {
+            state.conns.insert(key, Connection::new());
+        } else if let Some(mut conn) = state.conns.get_mut(&key) {
             if pkt.flag_syn && pkt.flag_ack {
                 conn.syn_ack();
             } else if pkt.from_local() {
@@ -116,11 +128,11 @@ fn callback(msg: &Message, conns: &mut Connections) {
                         delay.subsec_millis(),
                         pkt.src,
                     );
-                    if last_sent.elapsed() < min(*delay, *WAIT) {
+                    if last_sent.elapsed() < min(*delay, state.max_wait) {
                         verdict = Verdict::Drop;
                         info!("drop {}", log);
                     } else {
-                        if last_sent.elapsed() < *WAIT {
+                        if last_sent.elapsed() < state.max_wait {
                             info!("accept {}", log);
                         } else {
                             debug!("accept {}", log);
@@ -131,23 +143,23 @@ fn callback(msg: &Message, conns: &mut Connections) {
             }
         }
         if expired {
-            conns.remove(&key);
+            state.conns.remove(&key);
         }
-        if conns.len() > HASHMAP_LEN_HIGH {
-            let empties: Vec<_> = conns.iter().filter_map(|(key, conn)| {
+        if state.conns.len() > HASHMAP_LEN_HIGH {
+            let exp: Vec<_> = state.conns.iter().filter_map(|(key, conn)| {
                 if conn.last_sent.elapsed() > *CONN_TIMEOUT {
                     Some(key.clone())
                 } else {
                     None
                 }
             }).collect();
-            for key in empties {
-                conns.remove(&key);
+            for key in exp {
+                state.conns.remove(&key);
             }
         }
-        if conns.len() > HASHMAP_LEN_MAX {
+        if state.conns.len() > HASHMAP_LEN_MAX {
             // prevent DoS
-            conns.clear();
+            state.conns.clear();
         }
     }
     msg.set_verdict(verdict);
@@ -155,8 +167,8 @@ fn callback(msg: &Message, conns: &mut Connections) {
 
 fn main() {
     env_logger::init();
-    let conns = HashMap::new();
-    let mut queue = Queue::new(conns);
+    let state = State::new(DROP_WITHIN_MILLIS);
+    let mut queue = Queue::new(state);
     queue.open();
     if queue.bind(AF_INET) != 0 {
         panic!("fail to bind on queue");
